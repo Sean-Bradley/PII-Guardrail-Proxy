@@ -15,9 +15,8 @@ redaction audit logs, and SSE support for chat completions.
 
 ```bash
 cp .env .env.local  # optional; edit .env directly if preferred
-docker build -t vllm-pii-guard .
-docker run --rm -p 8080:8080 --env-file .env \
-  -v "$(pwd)/logs:/app/logs" vllm-pii-guard
+docker build -t pii-guardrail-proxy .
+docker run -d --name pii-guardrail-proxy --env-file .env -p 8080:8080 pii-guardrail-proxy
 ```
 
 If vLLM is running on the Docker host, `host.docker.internal` works on Docker Desktop.
