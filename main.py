@@ -17,6 +17,25 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 # ---------------------------------------------------------------------------
+# Setup logs folder
+# ---------------------------------------------------------------------------
+
+AUDIT_LOG_FILE = os.getenv(
+    "AUDIT_LOG_FILE",
+    "/app/logs/redactions.jsonl"
+)
+
+# Ensure the log directory exists
+log_path = Path(AUDIT_LOG_FILE)
+log_path.parent.mkdir(parents=True, exist_ok=True)
+
+# Verify that the application can write to it
+if not os.access(log_path.parent, os.W_OK):
+    raise RuntimeError(
+        f"Audit log directory is not writable: {log_path.parent}"
+    )
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")

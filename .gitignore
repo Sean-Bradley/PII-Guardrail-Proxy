@@ -1,6 +1,12 @@
-__pycache__/
-*.pyc
-.venv/
-*.db
+# Runtime audit logs
+logs/
+*.log
+
+# Environment secrets
 .env
-.vscode/
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
