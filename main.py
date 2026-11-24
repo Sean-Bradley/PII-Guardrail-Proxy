@@ -213,7 +213,7 @@ def client_response_headers(upstream_headers) -> Dict[str, str]:
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "pii-guardrail-proxy"}
+    return {"ok": True, "service": "PII Guardrail Proxy"}
 
 
 @app.get("/health")
