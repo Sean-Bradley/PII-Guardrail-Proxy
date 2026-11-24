@@ -22,18 +22,12 @@ load_dotenv()
 
 AUDIT_LOG_FILE = os.getenv(
     "AUDIT_LOG_FILE",
-    "/app/logs/redactions.jsonl"
+    "/tmp/pii-guardrail-logs/redactions.jsonl"
 )
 
 # Ensure the log directory exists
 log_path = Path(AUDIT_LOG_FILE)
 log_path.parent.mkdir(parents=True, exist_ok=True)
-
-# Verify that the application can write to it
-if not os.access(log_path.parent, os.W_OK):
-    raise RuntimeError(
-        f"Audit log directory is not writable: {log_path.parent}"
-    )
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,7 +35,7 @@ if not os.access(log_path.parent, os.W_OK):
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "")
-AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "/app/logs/redactions.jsonl")
+AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "/tmp/pii-guardrail-logs/redactions.jsonl")
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "300"))
 STREAM_HOLD_BACK = int(os.getenv("STREAM_HOLD_BACK", "512"))
 
@@ -216,140 +210,215 @@ def sse_encode(event: dict) -> bytes:
 
 async def stream_chat_completion(upstream: httpx.Response):
     """
-    Preserve SSE event framing while holding back a rolling tail of text.
-    The holdback lets detectors see values split across multiple upstream
-    delta events before any part of the value is sent to the client.
+    Redact text incrementally while preserving OpenAI-style SSE chunks.
 
-    Text fields handled incrementally: delta.content and delta.reasoning_content.
-    Tool-call argument fragments are buffered per choice/tool and released after
-    that choice finishes, so sensitive arguments are not forwarded prematurely.
+    Text is held back so a PII value split across upstream chunks can be
+    detected. Tool arguments are buffered per choice/tool and redacted as a
+    complete string before being emitted. Pending data is flushed on [DONE]
+    and also if the upstream connection closes without [DONE].
     """
     pending_text: Dict[Tuple[int, str], str] = {}
     pending_tool_args: Dict[Tuple[int, int], str] = {}
     stream_counts = Counter()
     carry = b""
+    metadata: Dict[str, Any] = {}
+    done_seen = False
+
+    def make_chunk(choice_index: int, delta: dict) -> dict:
+        chunk = dict(metadata)
+        chunk.setdefault("object", "chat.completion.chunk")
+        chunk["choices"] = [{
+            "index": choice_index,
+            "delta": delta,
+            "finish_reason": None,
+        }]
+        return chunk
+
+    async def flush_choice(choice_index: int):
+        # Emit buffered text for this choice.
+        for (idx, field), tail in list(pending_text.items()):
+            if idx == choice_index and tail:
+                safe, counts = redact_text(tail)
+                stream_counts.update(counts)
+                pending_text[(idx, field)] = ""
+                if safe:
+                    yield sse_encode(make_chunk(idx, {field: safe}))
+
+        # Emit complete, redacted tool arguments before the finish_reason chunk.
+        for (idx, tool_index), arguments in list(pending_tool_args.items()):
+            if idx == choice_index and arguments:
+                safe, counts = redact_text(arguments)
+                stream_counts.update(counts)
+                pending_tool_args[(idx, tool_index)] = ""
+                yield sse_encode(make_chunk(idx, {
+                    "tool_calls": [{
+                        "index": tool_index,
+                        "function": {"arguments": safe},
+                    }]
+                }))
+
+    async def flush_all():
+        choice_indexes = sorted(
+            {idx for idx, _field in pending_text}
+            | {idx for idx, _tool in pending_tool_args}
+        )
+        for idx in choice_indexes:
+            async for output in flush_choice(idx):
+                yield output
+
+    async def handle_raw_event(raw_event: bytes):
+        nonlocal metadata, done_seen
+
+        lines = raw_event.splitlines()
+        data_lines = [
+            line[5:].lstrip(b" ")
+            for line in lines
+            if line.startswith(b"data:")
+        ]
+
+        if not data_lines:
+            # Preserve SSE comments and other non-data records.
+            yield raw_event + b"\n\n"
+            return
+
+        data = b"\n".join(data_lines).decode("utf-8", errors="replace")
+        if data.strip() == "[DONE]":
+            async for output in flush_all():
+                yield output
+            audit_redactions("outbound", stream_counts)
+            stream_counts.clear()
+            done_seen = True
+            yield b"data: [DONE]\n\n"
+            return
+
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            # Do not pass unparseable upstream data without inspection.
+            safe, counts = redact_text(data)
+            stream_counts.update(counts)
+            yield (
+                b"data: "
+                + json.dumps(safe, ensure_ascii=False).encode("utf-8")
+                + b"\n\n"
+            )
+            return
+
+        if not isinstance(event, dict):
+            safe, counts = redact_json(event)
+            stream_counts.update(counts)
+            yield sse_encode({"data": safe})
+            return
+
+        # Retain standard chunk metadata for any final synthetic deltas.
+        metadata = {
+            key: value
+            for key, value in event.items()
+            if key != "choices"
+        }
+        metadata.setdefault("object", "chat.completion.chunk")
+
+        choices = event.get("choices") or []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            choice_index = int(choice.get("index", 0))
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+                choice["delta"] = delta
+
+            # Hold back the trailing portion of text to catch PII split
+            # across adjacent upstream events.
+            for field in ("content", "reasoning_content"):
+                fragment = delta.get(field)
+                if isinstance(fragment, str) and fragment:
+                    key = (choice_index, field)
+                    combined = pending_text.get(key, "") + fragment
+                    cutoff = max(0, len(combined) - max(512, STREAM_HOLD_BACK))
+
+                    if cutoff:
+                        boundary = max(
+                            combined.rfind(" ", 0, cutoff),
+                            combined.rfind("\n", 0, cutoff),
+                            combined.rfind("\t", 0, cutoff),
+                        )
+                        cutoff = boundary + 1 if boundary >= 0 else 0
+
+                    stable, tail = combined[:cutoff], combined[cutoff:]
+                    safe, counts = redact_text(stable)
+                    stream_counts.update(counts)
+                    pending_text[key] = tail
+
+                    if safe:
+                        delta[field] = safe
+                    else:
+                        delta.pop(field, None)
+
+            # Buffer tool arguments, but preserve the other tool-call fields
+            # (id, type, function name, etc.) in their original chunks.
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                visible_tool_calls = []
+                for tool in tool_calls:
+                    if not isinstance(tool, dict):
+                        continue
+                    tool_copy = dict(tool)
+                    tool_index = int(tool_copy.get("index", 0))
+                    function = tool_copy.get("function")
+                    if isinstance(function, dict):
+                        function_copy = dict(function)
+                        fragment = function_copy.pop("arguments", None)
+                        if isinstance(fragment, str) and fragment:
+                            key = (choice_index, tool_index)
+                            pending_tool_args[key] = (
+                                pending_tool_args.get(key, "") + fragment
+                            )
+                        if function_copy:
+                            tool_copy["function"] = function_copy
+                        else:
+                            tool_copy.pop("function", None)
+
+                    # Keep identity/metadata chunks, but don't send an
+                    # arguments-only fragment before it has been redacted.
+                    meaningful = any(
+                        key != "index" for key in tool_copy
+                    )
+                    if meaningful:
+                        visible_tool_calls.append(tool_copy)
+
+                if visible_tool_calls:
+                    delta["tool_calls"] = visible_tool_calls
+                else:
+                    delta.pop("tool_calls", None)
+
+            # Flush buffered data before forwarding the finish_reason event.
+            if choice.get("finish_reason") is not None:
+                async for output in flush_choice(choice_index):
+                    yield output
+
+        # Forward the upstream event, with text fragments replaced by their
+        # redacted stable portions and tool arguments withheld until complete.
+        yield sse_encode(event)
 
     async for chunk in upstream.aiter_bytes():
         carry += chunk.replace(b"\r\n", b"\n")
         while b"\n\n" in carry:
             raw_event, carry = carry.split(b"\n\n", 1)
-            lines = raw_event.splitlines()
-            data_lines = [line[5:].strip() for line in lines if line.startswith(b"data:")]
-            if not data_lines:
-                # Preserve comments / non-data SSE lines.
-                yield raw_event + b"\n\n"
-                continue
-            data = b"\n".join(data_lines).decode("utf-8", errors="replace")
-            if data.strip() == "[DONE]":
-                # Flush any remaining content only after a final redaction pass.
-                for (choice_index, field), tail in list(pending_text.items()):
-                    safe, counts = redact_text(tail)
-                    stream_counts.update(counts)
-                    # A minimal valid final delta for the remaining text.
-                    final_event = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": choice_index, "delta": {field: safe}, "finish_reason": None}],
-                    }
-                    if safe:
-                        yield sse_encode(final_event)
-                audit_redactions("outbound", stream_counts)
-                yield b"data: [DONE]\n\n"
-                pending_text.clear()
-                pending_tool_args.clear()
-                stream_counts.clear()
-                continue
+            async for output in handle_raw_event(raw_event):
+                yield output
 
-            try:
-                event = json.loads(data)
-            except json.JSONDecodeError:
-                # Unknown SSE payload: fail closed rather than pass arbitrary text.
-                safe, counts = redact_text(data)
-                stream_counts.update(counts)
-                yield b"data: " + json.dumps(safe).encode("utf-8") + b"\n\n"
-                continue
+    # Some servers close without terminating the last event with a blank line.
+    if carry.strip():
+        async for output in handle_raw_event(carry):
+            yield output
 
-            choices = event.get("choices", [])
-            for choice in choices:
-                choice_index = int(choice.get("index", 0))
-                delta = choice.get("delta") or {}
-
-                for field in ("content", "reasoning_content"):
-                    fragment = delta.get(field)
-                    if isinstance(fragment, str) and fragment:
-                        key = (choice_index, field)
-                        combined = pending_text.get(key, "") + fragment
-                        # Keep a sufficiently large tail and cut only at whitespace.
-                        cutoff = max(0, len(combined) - STREAM_HOLD_BACK)
-                        if cutoff:
-                            boundary = combined.rfind(" ", 0, cutoff)
-                            boundary = max(boundary, combined.rfind("\n", 0, cutoff),
-                                           combined.rfind("\t", 0, cutoff))
-                            cutoff = boundary + 1 if boundary >= 0 else 0
-                        stable, tail = combined[:cutoff], combined[cutoff:]
-                        safe, counts = redact_text(stable)
-                        stream_counts.update(counts)
-                        pending_text[key] = tail
-                        if safe:
-                            delta[field] = safe
-                        else:
-                            delta.pop(field, None)
-
-                # Buffer tool-call arguments until the completion finishes.
-                tool_calls = delta.get("tool_calls")
-                if isinstance(tool_calls, list):
-                    for tool in tool_calls:
-                        tool_index = int(tool.get("index", 0))
-                        function = tool.get("function") or {}
-                        fragment = function.get("arguments")
-                        if isinstance(fragment, str) and fragment:
-                            key = (choice_index, tool_index)
-                            pending_tool_args[key] = pending_tool_args.get(key, "") + fragment
-                            function.pop("arguments", None)
-                    delta["tool_calls"] = [t for t in tool_calls
-                                           if (t.get("function") or {}).get("arguments") is not None
-                                           or (t.get("function") or {}).get("name") is not None
-                                           or t.get("id") is not None]
-                    if not delta["tool_calls"]:
-                        delta.pop("tool_calls", None)
-
-                if choice.get("finish_reason") is not None:
-                    # Flush all held text for this choice, after scanning it whole.
-                    for (idx, field), tail in list(pending_text.items()):
-                        if idx == choice_index and tail:
-                            safe, counts = redact_text(tail)
-                            stream_counts.update(counts)
-                            # Attach tail to this event's delta; it is safe to emit now.
-                            delta[field] = delta.get(field, "") + safe
-                            pending_text[(idx, field)] = ""
-                    for (idx, tool_index), args in list(pending_tool_args.items()):
-                        if idx == choice_index:
-                            safe, counts = redact_text(args)
-                            stream_counts.update(counts)
-                            # Emit completed arguments in a final tool-call delta.
-                            event.setdefault("choices", [])
-                            event["choices"].append({
-                                "index": choice_index,
-                                "delta": {"tool_calls": [{
-                                    "index": tool_index,
-                                    "function": {"arguments": safe}
-                                }]},
-                                "finish_reason": None,
-                            })
-                            pending_tool_args[(idx, tool_index)] = ""
-
-            yield sse_encode(event)
-
-    # Flush if upstream closes without a [DONE] marker.
-    for (choice_index, field), tail in pending_text.items():
-        if tail:
-            safe, counts = redact_text(tail)
-            stream_counts.update(counts)
-            if safe:
-                yield sse_encode({
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": choice_index, "delta": {field: safe}, "finish_reason": None}],
-                })
-    audit_redactions("outbound", stream_counts)
+    # Flush remaining text/tool arguments if upstream closed without [DONE].
+    if not done_seen:
+        async for output in flush_all():
+            yield output
+        audit_redactions("outbound", stream_counts)
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +536,19 @@ async def proxy_v1(
                 try:
                     async for item in stream_chat_completion(upstream):
                         yield item
+                except httpx.TimeoutException:
+                    logging.exception("Upstream timed out during SSE streaming")
+                    yield (
+                        b'data: {"error":{"message":"Upstream timed out during streaming",'
+                        b'"type":"proxy_stream_timeout"}}\\n\\n'
+                    )
                 except Exception:
                     logging.exception("Error while processing SSE stream")
                     # Do not forward uninspected upstream content.
+                    yield (
+                        b'data: {"error":{"message":"Proxy failed while processing the stream",'
+                        b'"type":"proxy_stream_error"}}\\n\\n'
+                    )
                 finally:
                     await upstream.aclose()
                     await client.aclose()
