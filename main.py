@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -39,10 +40,26 @@ AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "/tmp/pii-guardrail-logs/redactions
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "300"))
 STREAM_HOLD_BACK = int(os.getenv("STREAM_HOLD_BACK", "512"))
 
+print(VLLM_BASE_URL)
+
+startup_config = {
+    "VLLM_BASE_URL": VLLM_BASE_URL,
+    "VLLM_API_KEY": VLLM_API_KEY,
+    "PROXY_API_KEY": PROXY_API_KEY,
+    "AUDIT_LOG_FILE": AUDIT_LOG_FILE,
+    "UPSTREAM_TIMEOUT": UPSTREAM_TIMEOUT,
+    "STREAM_HOLD_BACK": STREAM_HOLD_BACK,
+}
+startup_config_hash = hashlib.sha256(
+    json.dumps(startup_config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+).hexdigest()
+print(f"Startup configuration SHA-256: {startup_config_hash}")
+
 if not PROXY_API_KEY or PROXY_API_KEY == "change-me":
     raise RuntimeError("Set a strong PROXY_API_KEY in your environment.")
 if not VLLM_API_KEY:
     raise RuntimeError("Set VLLM_API_KEY in your environment.")
+
 
 # ---------------------------------------------------------------------------
 # Audit log: deliberately records metadata only, never matched values.
@@ -181,15 +198,22 @@ def upstream_headers(incoming_headers) -> Dict[str, str]:
         "authorization", "host", "content-length", "connection",
         "transfer-encoding", "keep-alive", "proxy-authenticate",
         "proxy-authorization", "te", "trailers", "upgrade",
+        "accept-encoding",
     }
     headers = {k: v for k, v in incoming_headers.items() if k.lower() not in excluded}
     headers["Authorization"] = f"Bearer {VLLM_API_KEY}"
+    headers["Accept-Encoding"] = "identity" 
     return headers
 
 
 def client_response_headers(upstream_headers) -> Dict[str, str]:
     allowed = {"content-type", "cache-control", "x-request-id"}
     return {k: v for k, v in upstream_headers.items() if k.lower() in allowed}
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "pii-guardrail-proxy"}
 
 
 @app.get("/health")
@@ -425,6 +449,18 @@ async def stream_chat_completion(upstream: httpx.Response):
 # OpenAI-compatible proxy route
 # ---------------------------------------------------------------------------
 
+def redact_upstream_url_for_logging(url: httpx.URL) -> str:
+    has_query = bool(url.query)
+    safe_url = url.copy_with(
+        username="",
+        password="",
+        query=b"",
+        fragment=""
+    )
+    safe_url_text = str(safe_url).removesuffix("#").removesuffix("?")
+    return f"{safe_url_text}?[redacted]" if has_query else safe_url_text
+
+
 @app.api_route(
     "/v1/{api_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -471,6 +507,7 @@ async def proxy_v1(
             pass
 
     client = httpx.AsyncClient(timeout=timeout)
+    upstream_url_for_log = "<unavailable>"
 
     try:
         # Build the request without sending it yet.
@@ -479,6 +516,9 @@ async def proxy_v1(
             target_url,
             headers=headers,
             content=outgoing_body
+        )
+        upstream_url_for_log = redact_upstream_url_for_logging(
+            upstream_request.url
         )
 
         # CRITICAL: stream=True prevents httpx from buffering the
@@ -489,9 +529,9 @@ async def proxy_v1(
         )
 
         logging.info(
-            "Upstream response: method=%s path=%s status=%s streaming=%s content_type=%s",
+            "Upstream response: method=%s url=%s status=%s streaming=%s content_type=%s",
             request.method,
-            request.url.path,
+            upstream_url_for_log,
             upstream.status_code,
             is_stream,
             upstream.headers.get("content-type", "")
@@ -513,16 +553,23 @@ async def proxy_v1(
                     content=safe_payload
                 )
             except Exception:
-                safe_text, counts = redact_text(
-                    error_body.decode("utf-8", errors="replace")
-                )
-                audit_redactions("outbound", counts)
-
-                return Response(
-                    content=safe_text,
-                    status_code=upstream.status_code,
-                    media_type="text/plain"
-                )
+                # Unknown error payload; don't corrupt bytes by decoding+replace.
+                # Return raw bytes as text/plain only if it decodes cleanly; otherwise return bytes.
+                try:
+                    text = error_body.decode("utf-8")  # no replace
+                    safe_text, counts = redact_text(text)
+                    audit_redactions("outbound", counts)
+                    return Response(
+                        content=safe_text,
+                        status_code=upstream.status_code,
+                        media_type="text/plain",
+                    )
+                except UnicodeDecodeError:
+                    return Response(
+                        content=error_body,
+                        status_code=upstream.status_code,
+                        media_type="application/octet-stream",
+                    )
 
         # Handle SSE streaming.
         if (
@@ -587,20 +634,22 @@ async def proxy_v1(
             )
 
         except Exception:
-            safe_text, counts = redact_text(
-                response_body.decode("utf-8", errors="replace")
-            )
-            audit_redactions("outbound", counts)
-
+            # Not JSON. Do NOT decode bytes with errors="replace" (it corrupts compressed/binary payloads).
+            # Return raw bytes and keep headers minimal/safe.
             return Response(
-                content=safe_text,
+                content=response_body,
                 status_code=response_status,
                 media_type=response_content_type,
-                headers=response_headers
+                headers=response_headers,
             )
 
     except httpx.TimeoutException:
         await client.aclose()
+        logging.error(
+            "Upstream request timed out: method=%s url=%s",
+            request.method,
+            upstream_url_for_log
+        )
         raise HTTPException(
             status_code=504,
             detail="Upstream model server timed out"
@@ -610,7 +659,9 @@ async def proxy_v1(
         await client.aclose()
 
         logging.error(
-            "Upstream request failed: %s",
+            "Upstream request failed: method=%s url=%s error=%s",
+            request.method,
+            upstream_url_for_log,
             type(exc).__name__
         )
 
