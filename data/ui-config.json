@@ -1,0 +1,101 @@
+{
+  "checks": {
+    "email": {
+      "display_name": "Email",
+      "enabled": true,
+      "action": "redact",
+      "regex": "\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa"
+      ]
+    },
+    "credit_card_pan": {
+      "display_name": "Credit Card",
+      "enabled": true,
+      "action": "redact",
+      "regex": "\\b(?:\\d[ -]*){15}\\d\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa",
+        "pci_dss"
+      ]
+    },
+    "phone_number": {
+      "display_name": "Phone",
+      "enabled": true,
+      "action": "redact",
+      "regex": "(?<!\\w)(?:\\+\\d{1,3}[ .-]?)?(?:\\(?\\d{2,5}\\)?[ .-]?)\\d{3,4}[ .-]?\\d{3,4}(?!\\w)",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa"
+      ]
+    },
+    "ssn": {
+      "display_name": "SSN",
+      "enabled": true,
+      "action": "redact",
+      "regex": "\\b(?!000|666|9\\d{2})\\d{3}-(?!00)\\d{2}-(?!0000)\\d{4}\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa"
+      ]
+    },
+    "ip_address": {
+      "display_name": "IP Address",
+      "enabled": true,
+      "action": "redact",
+      "regex": "\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa"
+      ]
+    },
+    "medical_record_number": {
+      "display_name": "Medical Record Number",
+      "enabled": true,
+      "action": "redact",
+      "regex": "(?i)\\b(?:MRN|Medical\\s*Record(?:\\s*(?:No|Number|#))?|Patient\\s*ID|Hospital\\s*(?:No|Number|#)|Chart\\s*(?:No|Number|#))[\\s:#-]*([A-Z]{0,3}\\d{5,10}[A-Z0-9]?)\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa",
+        "hipaa"
+      ]
+    },
+    "medical_diagnosis": {
+      "display_name": "Medical Diagnosis",
+      "enabled": false,
+      "action": "redact",
+      "regex": null,
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa",
+        "hipaa"
+      ]
+    },
+    "date_of_birth": {
+      "display_name": "DOB",
+      "enabled": true,
+      "action": "redact",
+      "regex": "\\b(?:0?[1-9]|[12]\\d|3[01])[/-](?:0?[1-9]|1[0-2])[/-](?:19|20)\\d{2}\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "ccpa",
+        "hipaa"
+      ]
+    },
+    "cvv": {
+      "display_name": "CCV",
+      "enabled": true,
+      "action": "redact",
+      "regex": "(?i)\\b(?:CVV|CVC|CVV2|CVC2|security code)\\s*[:#-]?\\s*\\d{3,4}\\b",
+      "regulatory_frameworks": [
+        "gdpr",
+        "pci_dss"
+      ]
+    }
+  },
+  "VLLM_BASE_URL": "",
+  "VLLM_API_KEY": "",
+  "PROXY_API_KEY": ""
+}
